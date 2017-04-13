@@ -15,10 +15,13 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
-
+import grequests
 import requests
 from bs4 import BeautifulSoup
 import csv
+from functools import partial
+from itertools import zip_longest
+
 
 QUERY_URL = 'https://www.wikidata.org/w/api.php'
 properties = frozenset(['P18', 'P17', 'P1376', 'P206', 'P625', 'P6', 'P1082', 'P2046', 'P41', 'P421', 'P856'])
@@ -37,26 +40,57 @@ def tag_to_name(tag):
     return name
 
 
-def name_to_wiki_entity_url(name):
+def responses_to_json(item):
+    json = item.json()['entities']
+    key = list(json.keys())[0]
+    return json[key]
+
+
+def get_concept_url(item):
+    if 'concepturi' in item:
+        return '{}.json'.format(item['concepturi'])
+
+
+def filter_items(item):
+    if 'P31' in item['claims'] and item['claims']['P31'][0]['mainsnak']['datavalue']['value']['numeric-id'] == 515:
+        return True
+    return False
+
+
+def name_to_wiki_entity_urls(name):
     print('searching for {}'.format(name))
     json = requests.get(QUERY_URL, {'action': 'wbsearchentities', 'search': name, 'language': 'en', 'format': 'json'}).json()
     if len(json['search']) is 0:
         print('no entity found in wikidata')
-        return name, '', None
-    search = json['search'][0]
-    print('found entity, label: {} and url {}'.format(search['label'], '{}.json'.format(search['concepturi'])))
-    return search['label'], search['id'], '{}.json'.format(search['concepturi'])
+        return name, []
+    return name, map(get_concept_url, json['search'])
 
 
-def wiki_entity_url_to_claims_set(item):
-    name, entity_id, url = item
-    print('getting data for {}, {}'.format(name, entity_id))
-    if url is None and entity_id == '':
-        return name, entity_id, frozenset()
-    json = requests.get(url).json()
-    claims_set = properties.intersection(frozenset(json['entities'][entity_id]['claims'].keys()))
+def get_and_filter_wiki_urls(item):
+    name, requests_to_do = item
+    rs = (grequests.get(u) for u in list(requests_to_do))
+    bla = grequests.map(rs)
+    jsons = map(responses_to_json, bla)
+    return name, filter(filter_items, jsons)
+
+
+def json_to_claims_set(json):
+    # print('calculating set size for  {}, {}'.format(name, entity_id))
+    claims_set = properties.intersection(frozenset(json['claims'].keys()))
     print(claims_set)
-    return name, entity_id, claims_set
+    return len(claims_set)
+
+
+def json_to_prop_count(json):
+    claims_length = len(json['claims'].keys())
+    print(claims_length)
+    return claims_length
+
+
+def map_json(item):
+    name, entities = item
+    entities = list(entities)
+    return name, map(json_to_claims_set, entities), map(json_to_prop_count, entities)
 
 # get the request
 raw_wiki = requests.get('https://en.wikipedia.org/wiki/Wikipedia:WikiAfrica/African_cities')
@@ -65,12 +99,15 @@ wiki_soup = BeautifulSoup(raw_wiki.text, 'html.parser')
 
 a_tags = filter(filter_unwanted, wiki_soup.select('#mw-content-text h2 + div a'))
 
-label_urls = map(name_to_wiki_entity_url, map(tag_to_name, a_tags))
-sets = map(wiki_entity_url_to_claims_set, label_urls)
+name_urls_to_check = map(name_to_wiki_entity_urls, map(tag_to_name, a_tags))
+ready_to_count = map(get_and_filter_wiki_urls, name_urls_to_check)
+ready_to_insert = map(map_json, ready_to_count)
 
 print('writing csv file')
-with open('sets.csv', 'w', newline='') as csv_file:
+with open('lengths.csv', 'w', newline='') as csv_file:
     sets_writer = csv.writer(csv_file)
-    sets_writer.writerow(('Name', 'Entity ID', 'Amount of props', 'Props List'))
-    for item in sets:
-        sets_writer.writerow((item[0], item[1], len(item[2]), ','.join(item[2])))
+    sets_writer.writerow(('Name', 'Total amount of props', 'Amount of props from list'))
+    for name, claims_set, count in ready_to_insert:
+        counts = zip_longest(count, claims_set, fillvalue=0)
+        for row in counts:
+            sets_writer.writerow((name, row[0], row[1]))
